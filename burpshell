@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+burpshell.py - Spawn a zsh shell with ALL traffic through Burp Suite.
+"""
+
+import os
+import argparse
+import subprocess
+import tempfile
+from pathlib import Path
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+DEFAULT_CERT = str(Path.home() / ".burp.pem")
+
+# The key insight: we use Module._resolveFilename to intercept undici imports
+# and return our monkey-patched version instead. This works even if undici
+# is imported AFTER our bootstrap runs.
+NODE_BOOTSTRAP = r"""
+'use strict';
+
+const http   = require('http');
+const https  = require('https');
+const tls    = require('tls');
+const fs     = require('fs');
+const Module = require('module');
+
+const PROXY_HOST = process.env._BURP_HOST || '127.0.0.1';
+const PROXY_PORT = parseInt(process.env._BURP_PORT || '8080', 10);
+const CA_CERT    = process.env.NODE_EXTRA_CA_CERTS;
+
+// ── 1. Burp CA cert into TLS context ────────────────────────────────────────
+let burpCert = null;
+if (CA_CERT) {
+  try {
+    burpCert = fs.readFileSync(CA_CERT);
+    const origCSC = tls.createSecureContext;
+    tls.createSecureContext = (opts = {}) => {
+      const cas = Array.isArray(opts.ca) ? opts.ca : opts.ca ? [opts.ca] : [];
+      return origCSC({ ...opts, ca: [...cas, burpCert] });
+    };
+  } catch(e) { process.stderr.write('[burp] CA cert load failed: ' + e.message + '\n'); }
+}
+
+// ── 2. CONNECT tunnel ────────────────────────────────────────────────────────
+function makeTunnel(host, port) {
+  return new Promise((resolve, reject) => {
+    // Use the real http.request (before any patching) to reach Burp
+    const req = http.request({
+      host: PROXY_HOST, port: PROXY_PORT,
+      method: 'CONNECT', path: `${host}:${port}`,
+      headers: { Host: `${host}:${port}`, 'Proxy-Connection': 'keep-alive' },
+    });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`CONNECT failed: ${res.statusCode}`));
+      } else {
+        resolve(socket);
+      }
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── 3. Patched http/https agents ─────────────────────────────────────────────
+class BurpHttpAgent extends http.Agent {
+  addRequest(req, opts) {
+    const host = opts.hostname || opts.host || 'localhost';
+    const port = opts.port || 80;
+    req.path = `http://${host}:${port}${opts.path || '/'}`;
+    super.addRequest(req, { ...opts, hostname: PROXY_HOST, host: PROXY_HOST, port: PROXY_PORT });
+  }
+}
+
+class BurpHttpsAgent extends https.Agent {
+  createConnection(opts, cb) {
+    const host = opts.hostname || opts.host;
+    const port = opts.port || 443;
+    makeTunnel(host, port).then(socket => {
+      const s = tls.connect({
+        socket, servername: host,
+        ca: burpCert ? [burpCert] : undefined,
+        rejectUnauthorized: true,
+      });
+      s.once('secureConnect', () => cb(null, s));
+      s.once('error', cb);
+    }).catch(cb);
+  }
+}
+
+http.globalAgent  = new BurpHttpAgent({ keepAlive: true });
+https.globalAgent = new BurpHttpsAgent({ keepAlive: true });
+
+// ── 4. Intercept undici at require() time ────────────────────────────────────
+// Instead of hoping setGlobalDispatcher sticks, we hook Module._load so that
+// EVERY time any code does require('undici'), they get our patched version.
+const UNDICI_PATHS = [
+  '/usr/share/nodejs/undici',
+  '/usr/share/nodejs/undici/index.js',
+];
+
+const _originalLoad = Module._load;
+Module._load = function(request, parent, isMain) {
+  const result = _originalLoad.apply(this, arguments);
+
+  // Check if this is undici being loaded (by path or by name)
+  const isUndici = request === 'undici' ||
+    UNDICI_PATHS.some(p => request === p || request.startsWith(p));
+
+  if (isUndici && result && result.ProxyAgent && result.setGlobalDispatcher) {
+    try {
+      const connectOpts = burpCert
+        ? { rejectUnauthorized: true, ca: burpCert }
+        : { rejectUnauthorized: false };
+
+      const proxy = new result.ProxyAgent({
+        uri: `http://${PROXY_HOST}:${PROXY_PORT}`,
+        connect: connectOpts,
+        requestTls: connectOpts,
+      });
+      result.setGlobalDispatcher(proxy);
+      process.stderr.write(`[burp] undici patched via Module._load (${request})\n`);
+    } catch(e) {
+      process.stderr.write('[burp] undici patch failed: ' + e.message + '\n');
+    }
+  }
+
+  return result;
+};
+
+// ── 5. Also patch it now if already in cache ─────────────────────────────────
+for (const p of UNDICI_PATHS) {
+  try {
+    const undici = require(p);
+    if (undici && undici.ProxyAgent && undici.setGlobalDispatcher) {
+      const connectOpts = burpCert
+        ? { rejectUnauthorized: true, ca: burpCert }
+        : { rejectUnauthorized: false };
+      const proxy = new undici.ProxyAgent({
+        uri: `http://${PROXY_HOST}:${PROXY_PORT}`,
+        connect: connectOpts,
+        requestTls: connectOpts,
+      });
+      undici.setGlobalDispatcher(proxy);
+      process.stderr.write(`[burp] undici pre-patched: ${p}\n`);
+      break;
+    }
+  } catch(e) {}
+}
+
+process.stderr.write(`[burp] bootstrap loaded — proxy http://${PROXY_HOST}:${PROXY_PORT}\n`);
+"""
+
+
+def find_cert(provided):
+    for c in [provided, DEFAULT_CERT,
+              str(Path.home() / "burp.pem"),
+              "/usr/local/share/ca-certificates/burp.crt"]:
+        if c and Path(c).exists():
+            return c
+    return ""
+
+
+def build_env(host, port, cert, bootstrap):
+    proxy_url = f"http://{host}:{port}"
+    env = os.environ.copy()
+
+    for var in ("http_proxy","HTTP_PROXY","https_proxy","HTTPS_PROXY","all_proxy","ALL_PROXY"):
+        env[var] = proxy_url
+    env.setdefault("no_proxy", "localhost,127.0.0.0/8,::1")
+    env.setdefault("NO_PROXY", env["no_proxy"])
+
+    if cert:
+        env["REQUESTS_CA_BUNDLE"] = cert
+        env["SSL_CERT_FILE"]      = cert
+        env["NODE_EXTRA_CA_CERTS"] = cert
+    else:
+        print("[!] Warning: No Burp CA cert found.")
+
+    existing = env.get("NODE_OPTIONS", "")
+    env["NODE_OPTIONS"] = f"{existing} --require {bootstrap}".strip()
+    env["_BURP_HOST"]   = host
+    env["_BURP_PORT"]   = str(port)
+
+    env["GLOBAL_AGENT_HTTP_PROXY"]  = proxy_url
+    env["GLOBAL_AGENT_HTTPS_PROXY"] = proxy_url
+    env["GIT_HTTP_PROXY"]  = proxy_url
+    env["GIT_HTTPS_PROXY"] = proxy_url
+    if cert: env["GIT_SSL_CAINFO"] = cert
+
+    env["BURP_SHELL"] = "1"
+    env["PROMPT"]     = "%F{red}[burp]%f %~ %# "
+    env["PS1"]        = r"\[\e[31m\][burp]\[\e[0m\] \w \$ "
+    return env
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--cert", default=None)
+    args = parser.parse_args()
+
+    cert   = find_cert(args.cert)
+    tmpdir = tempfile.mkdtemp(prefix="burpshell_")
+    bootstrap = os.path.join(tmpdir, "bootstrap.cjs")
+    with open(bootstrap, "w") as f:
+        f.write(NODE_BOOTSTRAP)
+
+    env = build_env(args.host, args.port, cert, bootstrap)
+
+    print(f"""
+╔══════════════════════════════════════════════════════════╗
+║                🔥  Burp Shell Active  🔥                 ║
+╠══════════════════════════════════════════════════════════╣
+║  Proxy  : http://{args.host}:{args.port}
+║  CA Cert: {cert or 'NOT FOUND'}
+║  Patches: globalAgent + undici Module._load hook
+╚══════════════════════════════════════════════════════════╝
+  Stderr shows [burp] lines confirming what got patched.
+  Type 'exit' to leave.
+""")
+
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    if not Path(shell).exists():
+        shell = "/bin/zsh" if Path("/bin/zsh").exists() else "/bin/bash"
+
+    try:
+        subprocess.run([shell], env=env)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            os.remove(bootstrap)
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    print("\n[burpshell] Exited.")
+
+
+if __name__ == "__main__":
+    main()
